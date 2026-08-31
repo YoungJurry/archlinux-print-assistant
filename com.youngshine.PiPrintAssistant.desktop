@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Pi 打印助手
+Comment=预览并安全打印图片、PDF 和 Office 文件
+Exec=pi-print-assistant %F
+Icon=pi-print-assistant
+Terminal=false
+StartupNotify=true
+Categories=Office;GTK;
+MimeType=image/jpeg;image/png;image/webp;image/bmp;image/tiff;application/pdf;application/msword;application/vnd.openxmlformats-officedocument.wordprocessingml.document;application/vnd.oasis.opendocument.text;application/vnd.ms-powerpoint;application/vnd.openxmlformats-officedocument.presentationml.presentation;application/vnd.oasis.opendocument.presentation;application/vnd.ms-excel;application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;application/vnd.oasis.opendocument.spreadsheet;
+Keywords=print;printer;打印;图片;PDF;
