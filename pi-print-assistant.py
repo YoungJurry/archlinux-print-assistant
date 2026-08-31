@@ -21,8 +21,9 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 gi.require_version("GdkPixbuf", "2.0")
+gi.require_version("Graphene", "1.0")
 gi.require_version("Poppler", "0.18")
-from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, Poppler
+from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Graphene, Gtk, Poppler
 
 import cairo
 from PIL import Image, ImageOps
@@ -299,7 +300,9 @@ class FileRow(Gtk.ListBoxRow):
         self,
         item: PrintItem,
         remove_cb: Callable[["FileRow"], None],
-        reorder_cb: Callable[["FileRow", float], bool],
+        drag_begin_cb: Callable[["FileRow"], None],
+        drag_update_cb: Callable[["FileRow", float], None],
+        drag_end_cb: Callable[["FileRow", float], None],
     ):
         super().__init__()
         self.item = item
@@ -330,18 +333,23 @@ class FileRow(Gtk.ListBoxRow):
         handle.set_cursor_from_name("grab")
         drag_gesture = Gtk.GestureDrag()
         drag_gesture.set_button(Gdk.BUTTON_PRIMARY)
-        drag_gesture.connect(
-            "drag-begin",
-            lambda _gesture, _x, _y: (self.add_css_class("dragging"), handle.set_cursor_from_name("grabbing")),
-        )
-        drag_gesture.connect(
-            "drag-end",
-            lambda _gesture, _x, offset_y: (
-                self.remove_css_class("dragging"),
-                handle.set_cursor_from_name("grab"),
-                reorder_cb(self, offset_y),
-            ),
-        )
+
+        def on_drag_begin(_gesture, _x, _y):
+            self.add_css_class("drag-placeholder")
+            handle.set_cursor_from_name("grabbing")
+            drag_begin_cb(self)
+
+        def on_drag_update(_gesture, _offset_x, offset_y):
+            drag_update_cb(self, offset_y)
+
+        def on_drag_end(_gesture, _offset_x, offset_y):
+            self.remove_css_class("drag-placeholder")
+            handle.set_cursor_from_name("grab")
+            drag_end_cb(self, offset_y)
+
+        drag_gesture.connect("drag-begin", on_drag_begin)
+        drag_gesture.connect("drag-update", on_drag_update)
+        drag_gesture.connect("drag-end", on_drag_end)
         handle.add_controller(drag_gesture)
 
 
@@ -367,6 +375,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.rebuild_source: int | None = None
         self.capabilities: PrinterCapabilities | None = None
         self.last_job_id: str | None = None
+        self.drag_state: dict | None = None
         self._build_ui()
         self._load_printers()
         self._install_controllers()
@@ -427,7 +436,10 @@ class MainWindow(Gtk.ApplicationWindow):
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scroll.set_child(self.file_list)
         scroll.set_vexpand(True)
-        box.append(scroll)
+        self.file_overlay = Gtk.Overlay()
+        self.file_overlay.set_child(scroll)
+        self.file_overlay.set_vexpand(True)
+        box.append(self.file_overlay)
         hint = Gtk.Label(label="拖动列表项目可调整打印顺序\n支持右键打开方式和 Ctrl+V", justify=Gtk.Justification.CENTER)
         hint.add_css_class("dim-label")
         hint.set_margin_top(8); hint.set_margin_bottom(10)
@@ -693,7 +705,13 @@ class MainWindow(Gtk.ApplicationWindow):
                 rejected.append(path.name)
                 continue
             item = PrintItem(path, source)
-            row = FileRow(item, self.remove_row, self.reorder_row)
+            row = FileRow(
+                item,
+                self.remove_row,
+                self.begin_live_drag,
+                self.update_live_drag,
+                self.end_live_drag,
+            )
             self.items.append(item); self.rows.append(row); self.file_list.append(row)
         if rejected:
             self.show_error("暂不支持：" + "、".join(rejected))
@@ -718,28 +736,142 @@ class MainWindow(Gtk.ApplicationWindow):
         self.print_button.set_sensitive(False)
         self.status.set_text("添加文件或按 Ctrl+V 粘贴剪贴板图片")
 
-    def reorder_row(self, source_row: FileRow, offset_y: float) -> bool:
-        if source_row not in self.rows:
+    def _make_drag_preview(self, row: FileRow) -> Gtk.Widget:
+        frame = Gtk.Frame()
+        frame.add_css_class("drag-floating")
+        content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        content.set_margin_top(8); content.set_margin_bottom(8)
+        content.set_margin_start(10); content.set_margin_end(10)
+        icon_name = "image-x-generic-symbolic" if row.item.kind == "图片" else (
+            "application-pdf-symbolic" if row.item.kind == "PDF" else "x-office-document-symbolic"
+        )
+        icon = Gtk.Image.new_from_icon_name(icon_name)
+        icon.set_pixel_size(32)
+        labels = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        name = Gtk.Label(label=row.item.display_name, xalign=0)
+        name.set_ellipsize(3)
+        detail = Gtk.Label(label=row.item.kind, xalign=0)
+        detail.add_css_class("dim-label")
+        labels.append(name); labels.append(detail)
+        labels.set_hexpand(True)
+        content.append(icon); content.append(labels)
+        frame.set_child(content)
+        frame.set_halign(Gtk.Align.START); frame.set_valign(Gtk.Align.START)
+        frame.set_can_target(False)
+        return frame
+
+    def begin_live_drag(self, row: FileRow) -> None:
+        if row not in self.rows or self.drag_state is not None:
+            return
+        ok, point = row.compute_point(self.file_overlay, Graphene.Point().init(0, 0))
+        if not ok:
+            point = Graphene.Point().init(0, 0)
+        floating = self._make_drag_preview(row)
+        floating.set_size_request(max(220, row.get_width()), max(1, row.get_height()))
+        floating.set_margin_start(max(0, int(point.x)))
+        floating.set_margin_top(max(0, int(point.y)))
+        self.file_overlay.add_overlay(floating)
+        start_top = float(point.y)
+        self.drag_state = {
+            "row": row,
+            "origin_index": self.rows.index(row),
+            "start_top": start_top,
+            "desired_top": start_top,
+            "display_top": start_top,
+            "last_frame_time": None,
+            "row_height": max(1, row.get_height()),
+            "floating": floating,
+            "changed": False,
+        }
+        self.drag_state["tick_id"] = self.file_overlay.add_tick_callback(self._tick_live_drag)
+        self.file_list.select_row(row)
+        self.status.set_text(f"正在拖动：{row.item.display_name}")
+
+    def _tick_live_drag(self, _widget, frame_clock) -> bool:
+        state = self.drag_state
+        if not state:
             return False
-        source_index = self.rows.index(source_row)
-        row_height = max(1, source_row.get_height())
-        steps = int(math.copysign(math.floor(abs(offset_y) / row_height + 0.5), offset_y))
-        target_index = max(0, min(len(self.rows) - 1, source_index + steps))
-        if target_index == source_index:
-            return False
-        item = self.items.pop(source_index)
-        moved_row = self.rows.pop(source_index)
-        self.items.insert(target_index, item)
-        self.rows.insert(target_index, moved_row)
-        self.file_list.remove(moved_row)
-        self.file_list.insert(moved_row, target_index)
-        self.file_list.select_row(moved_row)
-        self.status.set_text(f"已调整顺序：{moved_row.item.display_name}")
-        self.schedule_preview(immediate=True)
+        now = frame_clock.get_frame_time() / 1_000_000.0
+        last = state["last_frame_time"]
+        state["last_frame_time"] = now
+        if last is None:
+            alpha = 1.0
+        else:
+            # 约 45ms 的平滑跟随，既能紧跟鼠标，也能滤掉细小抖动。
+            delta_time = max(0.001, min(0.05, now - last))
+            alpha = 1.0 - math.exp(-delta_time / 0.045)
+        state["display_top"] += (state["desired_top"] - state["display_top"]) * alpha
+        state["floating"].set_margin_top(int(round(state["display_top"])))
         return True
 
+    def _move_dragged_row_live(self, row: FileRow, target_index: int) -> None:
+        current_index = self.rows.index(row)
+        while current_index < target_index:
+            crossing_index = current_index + 1
+            crossing_row = self.rows[crossing_index]
+            crossing_item = self.items[crossing_index]
+            self.rows.pop(crossing_index); self.items.pop(crossing_index)
+            self.rows.insert(current_index, crossing_row); self.items.insert(current_index, crossing_item)
+            self.file_list.remove(crossing_row)
+            self.file_list.insert(crossing_row, current_index)
+            current_index += 1
+        while current_index > target_index:
+            crossing_index = current_index - 1
+            crossing_row = self.rows[crossing_index]
+            crossing_item = self.items[crossing_index]
+            self.rows.pop(crossing_index); self.items.pop(crossing_index)
+            self.rows.insert(current_index, crossing_row); self.items.insert(current_index, crossing_item)
+            self.file_list.remove(crossing_row)
+            self.file_list.insert(crossing_row, current_index)
+            current_index -= 1
+
+    def update_live_drag(self, row: FileRow, offset_y: float) -> None:
+        state = self.drag_state
+        if not state or state["row"] is not row:
+            return
+        current_index = self.rows.index(row)
+        # GestureDrag 的 offset 是相对被拖控件计算的；列表换位后，控件本身
+        # 也移动了一行，GTK 会把这段位移反向计入 offset，造成浮层突然跳回。
+        # 加回控件相对起点移动的行数，得到相对窗口稳定的鼠标位移。
+        stable_offset_y = offset_y + (
+            current_index - state["origin_index"]
+        ) * state["row_height"]
+        max_top = max(0, self.file_overlay.get_height() - state["row_height"])
+        state["desired_top"] = max(0, min(max_top, state["start_top"] + stable_offset_y))
+
+        # 使用带滞回区间的换位阈值：向下越过 62% 才换位，换位后必须
+        # 反向退回到 38% 才恢复，避免鼠标停在中线附近时来回闪烁。
+        pointer_position = state["origin_index"] + stable_offset_y / state["row_height"]
+        target_index = current_index
+        while target_index < len(self.rows) - 1 and pointer_position > target_index + 0.62:
+            target_index += 1
+        while target_index > 0 and pointer_position < target_index - 0.62:
+            target_index -= 1
+        current_index = self.rows.index(row)
+        if target_index != current_index:
+            self._move_dragged_row_live(row, target_index)
+            state["changed"] = True
+            self.preview_dirty = True
+            self.print_button.set_sensitive(False)
+            self.status.set_text(f"移动到第 {target_index + 1} 位：{row.item.display_name}")
+
+    def end_live_drag(self, row: FileRow, _offset_y: float) -> None:
+        state = self.drag_state
+        if not state or state["row"] is not row:
+            return
+        self.file_overlay.remove_tick_callback(state["tick_id"])
+        self.file_overlay.remove_overlay(state["floating"])
+        changed = state["changed"]
+        self.drag_state = None
+        self.file_list.select_row(row)
+        if changed:
+            self.status.set_text(f"已调整到第 {self.rows.index(row) + 1} 位：{row.item.display_name}")
+            self.schedule_preview(immediate=True)
+        else:
+            self.status.set_text(f"顺序未改变：{row.item.display_name}")
+
     def _on_file_selected(self, _list_box, row: FileRow | None) -> None:
-        if row is None or row not in self.rows or self.preview_dirty:
+        if self.drag_state is not None or row is None or row not in self.rows or self.preview_dirty:
             return
         self._jump_to_row(row)
 
@@ -996,7 +1128,18 @@ class PrintApplication(Gtk.Application):
         Gtk.Application.do_startup(self)
         TMP_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
         css = Gtk.CssProvider()
-        css.load_from_data(b".heading { font-weight: 700; font-size: 1.1em; } .dim-label { opacity: 0.68; font-size: 0.9em; }")
+        css.load_from_data(b"""
+            .heading { font-weight: 700; font-size: 1.1em; }
+            .dim-label { opacity: 0.68; font-size: 0.9em; }
+            .drag-placeholder { opacity: 0.20; }
+            .drag-floating {
+                background-color: @theme_bg_color;
+                border: 2px solid #7aa2f7;
+                border-radius: 8px;
+                box-shadow: 0 8px 20px rgba(0, 0, 0, 0.38);
+                opacity: 0.96;
+            }
+        """)
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
         )
