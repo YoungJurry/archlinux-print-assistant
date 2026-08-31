@@ -1,11 +1,14 @@
 # Maintainer: youngshine
-pkgname=pi-print-assistant
-pkgver=0.3.0
+pkgname=archlinux-print-assistant
+pkgver=0.4.0
 pkgrel=1
-pkgdesc='GTK4 print assistant with PDF preview, clipboard images, and reliable duplex printing'
+pkgdesc='Arch Linux GTK4 print assistant with preview, clipboard images, and reliable duplex printing'
 arch=('any')
-url='https://github.com/YoungJurry/pi-print-assistant'
+url='https://github.com/YoungJurry/archlinux-print-assistant'
 license=('MIT')
+provides=('pi-print-assistant')
+conflicts=('pi-print-assistant')
+replaces=('pi-print-assistant')
 depends=(
   'python'
   'python-gobject'
@@ -21,31 +24,31 @@ depends=(
   'desktop-file-utils'
 )
 source=(
-  'pi-print-assistant.py'
-  'com.youngshine.PiPrintAssistant.desktop'
-  'pi-print-assistant.svg'
+  'archlinux-print-assistant.py'
+  'com.youngshine.ArchlinuxPrintAssistant.desktop'
+  'archlinux-print-assistant.svg'
   'README.md'
   'CHANGELOG.md'
   'LICENSE'
 )
-sha256sums=('d6990f608290157a63054af8d5ebdcfbfad0130fd53f12f230d8ab597d5e0ca2'
-            '48cf909ad5013c45797e987e70836ea2165894ac331f321f854f5ec334e95bf9'
+sha256sums=('ee3dad19ee49cb15bb194582284fe6bdd25388f5d1cb11decf3206fc33000111'
+            'd2e7d6f0c800affa80a0aebbc88d37741ece7630bd1b8c46f31c8a1ffef95ab1'
             '59466f947822761b667c7d17f8d378a5891ded91cdc085074cb073219d60fb9a'
-            '5212a9f8528871ba6f9b68845796dc95dc4323569e7879f921aec58220af87f4'
-            '12264c3d8412f71df00e37028dfba85ad5d244a7203731bd5f4f9a3e11c56058'
+            '0b9a1b6860169049c45786b6f0069420e72457cc80930b85bf79ca7061f128eb'
+            'c74ca2765cd5e47c20ed7febd3da4e50391652dd830b39448c7cb348267627cc'
             'a6ce45fafbc8cffc9b31a0ff49eda39ffbaf11f0e8b41e333f3fc9c472467237')
 
 package() {
-  install -Dm755 "$srcdir/pi-print-assistant.py" \
-    "$pkgdir/usr/bin/pi-print-assistant"
-  install -Dm644 "$srcdir/com.youngshine.PiPrintAssistant.desktop" \
-    "$pkgdir/usr/share/applications/com.youngshine.PiPrintAssistant.desktop"
-  install -Dm644 "$srcdir/pi-print-assistant.svg" \
-    "$pkgdir/usr/share/icons/hicolor/scalable/apps/pi-print-assistant.svg"
+  install -Dm755 "$srcdir/archlinux-print-assistant.py" \
+    "$pkgdir/usr/bin/archlinux-print-assistant"
+  install -Dm644 "$srcdir/com.youngshine.ArchlinuxPrintAssistant.desktop" \
+    "$pkgdir/usr/share/applications/com.youngshine.ArchlinuxPrintAssistant.desktop"
+  install -Dm644 "$srcdir/archlinux-print-assistant.svg" \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/archlinux-print-assistant.svg"
   install -Dm644 "$srcdir/README.md" \
-    "$pkgdir/usr/share/doc/pi-print-assistant/README.md"
+    "$pkgdir/usr/share/doc/archlinux-print-assistant/README.md"
   install -Dm644 "$srcdir/CHANGELOG.md" \
-    "$pkgdir/usr/share/doc/pi-print-assistant/CHANGELOG.md"
+    "$pkgdir/usr/share/doc/archlinux-print-assistant/CHANGELOG.md"
   install -Dm644 "$srcdir/LICENSE" \
-    "$pkgdir/usr/share/licenses/pi-print-assistant/LICENSE"
+    "$pkgdir/usr/share/licenses/archlinux-print-assistant/LICENSE"
 }

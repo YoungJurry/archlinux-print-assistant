@@ -32,10 +32,10 @@ from pypdf._page import PageObject
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 
-APP_ID = "com.youngshine.PiPrintAssistant"
-APP_NAME = "Pi 打印助手"
+APP_ID = "com.youngshine.ArchlinuxPrintAssistant"
+APP_NAME = "arch打印助手"
 DEFAULT_PRINTER = "HP_LaserJet_M403dn"
-TMP_ROOT = Path("/tmp/pi-print")
+TMP_ROOT = Path(f"/tmp/archlinux-print-assistant-{os.getuid()}")
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 PDF_SUFFIXES = {".pdf"}
 OFFICE_SUFFIXES = {
@@ -1175,7 +1175,7 @@ def self_test(files: list[str], output: str) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--self-test", action="store_true")
-    parser.add_argument("--output", default="/tmp/pi-print-self-test.pdf")
+    parser.add_argument("--output", default="/tmp/archlinux-print-assistant-self-test.pdf")
     parser.add_argument("files", nargs="*")
     known, _unknown = parser.parse_known_args()
     if known.self_test:

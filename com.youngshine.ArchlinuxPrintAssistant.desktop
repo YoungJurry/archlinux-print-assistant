@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=Pi 打印助手
+Name=arch打印助手
 Comment=预览并安全打印图片、PDF 和 Office 文件
-Exec=pi-print-assistant %F
-Icon=pi-print-assistant
+Exec=archlinux-print-assistant %F
+Icon=archlinux-print-assistant
 Terminal=false
 StartupNotify=true
 Categories=Office;GTK;
