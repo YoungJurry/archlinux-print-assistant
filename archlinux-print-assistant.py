@@ -375,6 +375,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self.rebuild_source: int | None = None
         self.capabilities: PrinterCapabilities | None = None
         self.last_job_id: str | None = None
+        self.job_monitor_source: int | None = None
+        self.job_missing_polls = 0
         self.drag_state: dict | None = None
         self._build_ui()
         self._load_printers()
@@ -565,7 +567,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.print_button.add_css_class("suggested-action")
         self.print_button.set_sensitive(False)
         self.print_button.connect("clicked", self._on_print_clicked)
-        self.stop_button = Gtk.Button(label="紧急停止上个任务")
+        self.stop_button = Gtk.Button(label="紧急停止当前任务")
         self.stop_button.add_css_class("destructive-action")
         self.stop_button.set_visible(False)
         self.stop_button.connect("clicked", self._on_emergency_stop)
@@ -1100,18 +1102,84 @@ class MainWindow(Gtk.ApplicationWindow):
             match = re.search(r"request id is (\S+)", output)
             self.last_job_id = match.group(1) if match else None
             self.stop_button.set_visible(bool(self.last_job_id))
+            if self.last_job_id:
+                self._start_job_monitor()
             self.status.set_text(f"打印任务已提交：{output}")
             done = Gtk.AlertDialog(message="打印任务已提交", detail=f"{output}\n请核对实际出纸结果。")
             done.show(self)
         except Exception as exc:
             self.show_error(str(exc))
 
+    @staticmethod
+    def _cups_job_ids(which: str) -> set[str]:
+        env = {**os.environ, "LC_ALL": "C"}
+        result = subprocess.run(
+            ["lpstat", "-W", which, "-o"],
+            text=True, capture_output=True, env=env,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "无法读取 CUPS 任务状态")
+        return {
+            line.split()[0]
+            for line in result.stdout.splitlines()
+            if line.split()
+        }
+
+    def _start_job_monitor(self) -> None:
+        if self.job_monitor_source is not None:
+            GLib.source_remove(self.job_monitor_source)
+        self.job_missing_polls = 0
+        self.job_monitor_source = GLib.timeout_add_seconds(1, self._poll_print_job)
+
+    def _finish_job_monitor(self, job_id: str, message: str, from_poll: bool = False) -> None:
+        if self.job_monitor_source is not None and not from_poll:
+            GLib.source_remove(self.job_monitor_source)
+        self.job_monitor_source = None
+        self.job_missing_polls = 0
+        self.last_job_id = None
+        self.stop_button.set_visible(False)
+        self.status.set_text(f"{message}：{job_id}")
+
+    def _poll_print_job(self) -> bool:
+        job_id = self.last_job_id
+        if not job_id:
+            self.job_monitor_source = None
+            self.stop_button.set_visible(False)
+            return False
+        try:
+            if job_id in self._cups_job_ids("not-completed"):
+                self.job_missing_polls = 0
+                return True
+            if job_id in self._cups_job_ids("completed"):
+                self._finish_job_monitor(job_id, "打印任务已完成", from_poll=True)
+                return False
+            # 某些 CUPS 配置不保留已完成任务；连续三次不在活动队列中，
+            # 同样视为任务已经离开队列，避免刚提交时的短暂查询竞态。
+            self.job_missing_polls += 1
+            if self.job_missing_polls >= 3:
+                self._finish_job_monitor(job_id, "打印任务已结束", from_poll=True)
+                return False
+            return True
+        except Exception:
+            # 临时查询失败时保留按钮，下次继续检查，不能误判任务结束。
+            return True
+
     def _on_emergency_stop(self, _button) -> None:
         if not self.last_job_id:
             return
-        subprocess.run(["cupsdisable", self.current_settings().printer], capture_output=True)
-        subprocess.run(["cancel", self.last_job_id], capture_output=True)
-        self.status.set_text(f"已暂停打印机并尝试取消任务 {self.last_job_id}；如仍出纸，请按打印机面板取消键")
+        job_id = self.last_job_id
+        result = subprocess.run(["cancel", job_id], text=True, capture_output=True)
+        if result.returncode == 0:
+            self._finish_job_monitor(job_id, "已取消打印任务")
+            return
+        # 只有常规取消失败时才暂停打印机，避免正常取消也永久停用队列。
+        printer = self.current_settings().printer
+        disabled = subprocess.run(["cupsdisable", printer], text=True, capture_output=True)
+        self._finish_job_monitor(job_id, "已尝试紧急停止打印任务")
+        if disabled.returncode == 0:
+            self.status.set_text(
+                f"已暂停打印机并尝试取消任务 {job_id}；恢复前请执行 cupsenable {printer}"
+            )
 
     def show_error(self, message: str) -> None:
         self.status.set_text(message)
