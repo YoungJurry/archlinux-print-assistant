@@ -244,7 +244,11 @@ class DocumentBuilder:
             if suffix in IMAGE_SUFFIXES:
                 item_pdf = work_dir / f"image-{index}.pdf"
                 self.image_pdf(item.path, settings, item_pdf)
-                self.normalize_pdf(item_pdf, settings, writer)
+                # image_pdf 已经生成目标纸张尺寸；直接加入，避免再次套入
+                # 一层 A4 页面而产生重复白边。
+                image_reader = PdfReader(str(item_pdf))
+                for page in image_reader.pages:
+                    writer.add_page(page)
             elif suffix in PDF_SUFFIXES:
                 self.normalize_pdf(item.path, settings, writer)
             elif suffix in OFFICE_SUFFIXES:
@@ -375,6 +379,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.rebuild_source: int | None = None
         self.capabilities: PrinterCapabilities | None = None
         self.last_job_id: str | None = None
+        self.last_job_printer: str | None = None
         self.job_monitor_source: int | None = None
         self.job_missing_polls = 0
         self.drag_state: dict | None = None
@@ -567,13 +572,19 @@ class MainWindow(Gtk.ApplicationWindow):
         self.print_button.add_css_class("suggested-action")
         self.print_button.set_sensitive(False)
         self.print_button.connect("clicked", self._on_print_clicked)
-        self.stop_button = Gtk.Button(label="紧急停止当前任务")
-        self.stop_button.add_css_class("destructive-action")
-        self.stop_button.set_visible(False)
-        self.stop_button.connect("clicked", self._on_emergency_stop)
+        self.pause_button = Gtk.Button(label="暂停打印")
+        self.pause_button.set_visible(False)
+        self.pause_button.connect("clicked", self._on_pause_continue)
+        self.clear_queue_button = Gtk.Button(label="暂停并清空打印队列")
+        self.clear_queue_button.add_css_class("destructive-action")
+        self.clear_queue_button.set_visible(False)
+        self.clear_queue_button.connect("clicked", self._on_pause_and_clear)
         action = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         action.set_margin_top(8); action.set_margin_bottom(10); action.set_margin_start(10); action.set_margin_end(10)
-        action.append(self.spinner); action.append(self.print_button); action.append(self.stop_button)
+        action.append(self.spinner)
+        action.append(self.print_button)
+        action.append(self.pause_button)
+        action.append(self.clear_queue_button)
         outer.append(action)
         return outer
 
@@ -1093,22 +1104,112 @@ class MainWindow(Gtk.ApplicationWindow):
                 required = "DuplexNoTumble" if settings.duplex == "long" else "DuplexTumble"
                 if required not in values:
                     raise RuntimeError("当前驱动未公开所选双面功能，任务已阻止")
-            command = self._print_command(settings)
-            env = {**os.environ, "LC_ALL": "C"}
-            result = subprocess.run(command, text=True, capture_output=True, env=env)
-            if result.returncode != 0:
-                raise RuntimeError(result.stderr.strip() or "lp 提交失败")
-            output = result.stdout.strip()
-            match = re.search(r"request id is (\S+)", output)
-            self.last_job_id = match.group(1) if match else None
-            self.stop_button.set_visible(bool(self.last_job_id))
-            if self.last_job_id:
-                self._start_job_monitor()
-            self.status.set_text(f"打印任务已提交：{output}")
-            done = Gtk.AlertDialog(message="打印任务已提交", detail=f"{output}\n请核对实际出纸结果。")
-            done.show(self)
+            self._preflight_print(settings)
         except Exception as exc:
             self.show_error(str(exc))
+
+    @staticmethod
+    def _pending_jobs(printer: str) -> list[str]:
+        env = {**os.environ, "LC_ALL": "C"}
+        result = subprocess.run(
+            ["lpstat", "-W", "not-completed", "-o", printer],
+            text=True, capture_output=True, env=env,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "无法读取打印队列")
+        return [line.split()[0] for line in result.stdout.splitlines() if line.split()]
+
+    @staticmethod
+    def _printer_is_enabled(printer: str) -> bool:
+        env = {**os.environ, "LC_ALL": "C"}
+        result = subprocess.run(
+            ["lpstat", "-p", printer], text=True, capture_output=True, env=env,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "无法读取打印机状态")
+        return " disabled " not in f" {result.stdout.lower()} "
+
+    def _ensure_printer_enabled(self, printer: str) -> None:
+        if self._printer_is_enabled(printer):
+            return
+        result = subprocess.run(["cupsenable", printer], text=True, capture_output=True)
+        if result.returncode != 0 or not self._printer_is_enabled(printer):
+            raise RuntimeError(result.stderr.strip() or f"无法启用打印机 {printer}")
+        self.status.set_text(f"已自动启用打印机：{printer}")
+
+    def _preflight_print(self, settings: PrintSettings) -> None:
+        old_jobs = self._pending_jobs(settings.printer)
+        if not old_jobs:
+            self._ensure_printer_enabled(settings.printer)
+            self._submit_print(settings)
+            return
+        shown = "\n".join(old_jobs[:10])
+        if len(old_jobs) > 10:
+            shown += f"\n……另有 {len(old_jobs) - 10} 个任务"
+        prompt = Gtk.AlertDialog(
+            message=f"检测到 {len(old_jobs)} 个旧任务",
+            detail=(
+                f"打印机：{settings.printer}\n{shown}\n\n"
+                "丢弃旧任务：取消以上任务后打印当前内容。\n"
+                "打印旧任务：保留旧任务，当前内容排在队列末尾。"
+            ),
+        )
+        prompt.set_buttons(["取消", "丢弃旧任务", "打印旧任务"])
+        prompt.set_cancel_button(0); prompt.set_default_button(0)
+        prompt.choose(
+            self, None,
+            lambda d, r: self._on_old_jobs_choice(d, r, settings, old_jobs),
+        )
+
+    def _on_old_jobs_choice(
+        self,
+        dialog: Gtk.AlertDialog,
+        result,
+        settings: PrintSettings,
+        old_jobs: list[str],
+    ) -> None:
+        try:
+            choice = dialog.choose_finish(result)
+            if choice == 0:
+                return
+            if choice == 1:
+                paused = subprocess.run(
+                    ["cupsdisable", settings.printer], text=True, capture_output=True,
+                )
+                if paused.returncode != 0:
+                    raise RuntimeError(paused.stderr.strip() or "无法暂停打印机以清理旧任务")
+                failures: list[str] = []
+                for job_id in old_jobs:
+                    cancelled = subprocess.run(
+                        ["cancel", job_id], text=True, capture_output=True,
+                    )
+                    if cancelled.returncode != 0:
+                        failures.append(job_id)
+                remaining = self._pending_jobs(settings.printer)
+                if failures or remaining:
+                    names = ", ".join(failures or remaining)
+                    raise RuntimeError(f"旧任务未能全部取消：{names}")
+            self._ensure_printer_enabled(settings.printer)
+            self._submit_print(settings)
+        except Exception as exc:
+            self.show_error(str(exc))
+
+    def _submit_print(self, settings: PrintSettings) -> None:
+        command = self._print_command(settings)
+        env = {**os.environ, "LC_ALL": "C"}
+        result = subprocess.run(command, text=True, capture_output=True, env=env)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "lp 提交失败")
+        output = result.stdout.strip()
+        match = re.search(r"request id is (\S+)", output)
+        self.last_job_id = match.group(1) if match else None
+        self.last_job_printer = settings.printer
+        if self.last_job_id:
+            self._start_job_monitor()
+        self._refresh_queue_controls(settings.printer)
+        self.status.set_text(f"打印任务已提交：{output}")
+        done = Gtk.AlertDialog(message="打印任务已提交", detail=f"{output}\n请核对实际出纸结果。")
+        done.show(self)
 
     @staticmethod
     def _cups_job_ids(which: str) -> set[str]:
@@ -1125,11 +1226,49 @@ class MainWindow(Gtk.ApplicationWindow):
             if line.split()
         }
 
+    @staticmethod
+    def _job_completed_successfully(job_id: str, printer: str) -> bool | None:
+        env = {**os.environ, "LC_ALL": "C"}
+        result = subprocess.run(
+            ["lpstat", "-W", "completed", "-l", "-o", printer],
+            text=True, capture_output=True, env=env,
+        )
+        if result.returncode != 0:
+            return None
+        current_job: str | None = None
+        for line in result.stdout.splitlines():
+            if line and not line[0].isspace():
+                current_job = line.split()[0]
+            elif current_job == job_id and line.strip().startswith("Alerts:"):
+                return "job-completed-successfully" in line
+        return None
+
     def _start_job_monitor(self) -> None:
         if self.job_monitor_source is not None:
             GLib.source_remove(self.job_monitor_source)
         self.job_missing_polls = 0
         self.job_monitor_source = GLib.timeout_add_seconds(1, self._poll_print_job)
+
+    def _refresh_queue_controls(self, printer: str | None = None) -> None:
+        printer = printer or self.last_job_printer
+        if not printer:
+            self.pause_button.set_visible(False)
+            self.clear_queue_button.set_visible(False)
+            return
+        try:
+            jobs = self._pending_jobs(printer)
+            enabled = self._printer_is_enabled(printer)
+        except Exception:
+            return
+        if enabled:
+            self.pause_button.set_label("暂停打印")
+            self.pause_button.set_visible(bool(jobs))
+        else:
+            self.pause_button.set_label("继续打印")
+            self.pause_button.set_visible(True)
+        self.clear_queue_button.set_visible(bool(jobs))
+        if enabled and not jobs and not self.last_job_id:
+            self.last_job_printer = None
 
     def _finish_job_monitor(self, job_id: str, message: str, from_poll: bool = False) -> None:
         if self.job_monitor_source is not None and not from_poll:
@@ -1137,21 +1276,32 @@ class MainWindow(Gtk.ApplicationWindow):
         self.job_monitor_source = None
         self.job_missing_polls = 0
         self.last_job_id = None
-        self.stop_button.set_visible(False)
         self.status.set_text(f"{message}：{job_id}")
+        self._refresh_queue_controls()
 
     def _poll_print_job(self) -> bool:
         job_id = self.last_job_id
         if not job_id:
             self.job_monitor_source = None
-            self.stop_button.set_visible(False)
+            self._refresh_queue_controls()
             return False
         try:
             if job_id in self._cups_job_ids("not-completed"):
                 self.job_missing_polls = 0
+                self._refresh_queue_controls()
                 return True
             if job_id in self._cups_job_ids("completed"):
-                self._finish_job_monitor(job_id, "打印任务已完成", from_poll=True)
+                printer = self.last_job_printer or self.current_settings().printer
+                succeeded = self._job_completed_successfully(job_id, printer)
+                if succeeded is False:
+                    self._finish_job_monitor(job_id, "打印任务未成功", from_poll=True)
+                    warning = Gtk.AlertDialog(
+                        message="打印任务未成功",
+                        detail=f"任务 {job_id} 已离开队列，但 CUPS 没有成功打印标记。",
+                    )
+                    warning.show(self)
+                else:
+                    self._finish_job_monitor(job_id, "打印任务已完成", from_poll=True)
                 return False
             # 某些 CUPS 配置不保留已完成任务；连续三次不在活动队列中，
             # 同样视为任务已经离开队列，避免刚提交时的短暂查询竞态。
@@ -1161,25 +1311,76 @@ class MainWindow(Gtk.ApplicationWindow):
                 return False
             return True
         except Exception:
-            # 临时查询失败时保留按钮，下次继续检查，不能误判任务结束。
+            # 临时查询失败时保留控制按钮，下次继续检查。
             return True
 
-    def _on_emergency_stop(self, _button) -> None:
-        if not self.last_job_id:
+    def _on_pause_continue(self, _button) -> None:
+        printer = self.last_job_printer
+        if not printer:
             return
-        job_id = self.last_job_id
-        result = subprocess.run(["cancel", job_id], text=True, capture_output=True)
-        if result.returncode == 0:
-            self._finish_job_monitor(job_id, "已取消打印任务")
+        try:
+            if self._printer_is_enabled(printer):
+                result = subprocess.run(["cupsdisable", printer], text=True, capture_output=True)
+                if result.returncode != 0:
+                    raise RuntimeError(result.stderr.strip() or "无法暂停打印机")
+                self.status.set_text(f"已暂停打印机，队列任务保持不变：{printer}")
+            else:
+                self._ensure_printer_enabled(printer)
+                self.status.set_text(f"已继续打印：{printer}")
+            self._refresh_queue_controls(printer)
+        except Exception as exc:
+            self.show_error(str(exc))
+
+    def _on_pause_and_clear(self, _button) -> None:
+        printer = self.last_job_printer
+        if not printer:
             return
-        # 只有常规取消失败时才暂停打印机，避免正常取消也永久停用队列。
-        printer = self.current_settings().printer
-        disabled = subprocess.run(["cupsdisable", printer], text=True, capture_output=True)
-        self._finish_job_monitor(job_id, "已尝试紧急停止打印任务")
-        if disabled.returncode == 0:
-            self.status.set_text(
-                f"已暂停打印机并尝试取消任务 {job_id}；恢复前请执行 cupsenable {printer}"
+        try:
+            jobs = self._pending_jobs(printer)
+            if not jobs:
+                self._refresh_queue_controls(printer)
+                return
+            detail = "\n".join(jobs[:10])
+            if len(jobs) > 10:
+                detail += f"\n……另有 {len(jobs) - 10} 个任务"
+            dialog = Gtk.AlertDialog(
+                message=f"暂停并删除 {len(jobs)} 个打印任务？",
+                detail=f"打印机：{printer}\n{detail}\n\n此操作不能撤销。",
             )
+            dialog.set_buttons(["取消", "暂停并清空"])
+            dialog.set_cancel_button(0); dialog.set_default_button(0)
+            dialog.choose(
+                self, None,
+                lambda d, r: self._on_clear_queue_confirmed(d, r, printer),
+            )
+        except Exception as exc:
+            self.show_error(str(exc))
+
+    def _on_clear_queue_confirmed(
+        self, dialog: Gtk.AlertDialog, result, printer: str,
+    ) -> None:
+        try:
+            if dialog.choose_finish(result) != 1:
+                return
+            paused = subprocess.run(["cupsdisable", printer], text=True, capture_output=True)
+            if paused.returncode != 0:
+                raise RuntimeError(paused.stderr.strip() or "无法暂停打印机")
+            jobs = self._pending_jobs(printer)
+            for job_id in jobs:
+                subprocess.run(["cancel", job_id], text=True, capture_output=True)
+            remaining = self._pending_jobs(printer)
+            if remaining:
+                raise RuntimeError("以下任务未能取消：" + ", ".join(remaining))
+            if self.job_monitor_source is not None:
+                GLib.source_remove(self.job_monitor_source)
+            self.job_monitor_source = None
+            self.job_missing_polls = 0
+            self.last_job_id = None
+            self.last_job_printer = printer
+            self.status.set_text(f"已暂停打印机并清空 {len(jobs)} 个任务：{printer}")
+            self._refresh_queue_controls(printer)
+        except Exception as exc:
+            self.show_error(str(exc))
 
     def show_error(self, message: str) -> None:
         self.status.set_text(message)
